@@ -1,9 +1,10 @@
-#include <SimpleRotary.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SH110X.h>
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include "utilities.h"
+#include "TouchDrvGT911.hpp"
 #include <Wire.h>
 #include <driver/i2s.h>
 #include <esp_err.h>
@@ -14,9 +15,11 @@
 
 #include "config.h"
 
+#define LILYGO_KB_SLAVE_ADDRESS 0x55
+
 // --- Display & Timing Constants ---
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
+#define SCREEN_WIDTH 320
+#define SCREEN_HEIGHT 240
 #define REFRESH_INTERVAL_MS 5000
 #define WIFI_CONNECT_TIMEOUT_MS 10000
 
@@ -24,9 +27,9 @@
 #define EARTH_RADIUS_KM 6371.0
 #define BLIP_LIFESPAN_FRAMES 90
 #define MAX_BLIPS 20
-#define RADAR_CENTER_X 96
-#define RADAR_CENTER_Y 36
-#define RADAR_RADIUS 27
+#define RADAR_CENTER_X 240
+#define RADAR_CENTER_Y 120
+#define RADAR_RADIUS 100
 
 // --- EEPROM Constants ---
 #define EEPROM_SIZE 64
@@ -39,12 +42,9 @@
 #define EEPROM_ADDR_COMPASS 24
 #define EEPROM_MAGIC_NUMBER 0xAD
 
-// --- Display & Rotary Objects ---
-Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-// Rotary wired as "volume" now adjusts radar range (switch still powers off)
-SimpleRotary VolumeSelector(33, 4, 23);
-// Rotary wired as "channel" now controls volume/speed/alert/compass (switch still cycles modes)
-SimpleRotary ChannelSelector(25, 32, 2);
+// --- Display & Input Objects ---
+TFT_eSPI display;
+TouchDrvGT911 touch;
 
 // --- Volatile variables for ISR-safe encoder reading ---
 volatile byte VolumeChange = 0, VolumePush = 0;
@@ -116,7 +116,7 @@ void loadSettings();
 void fetchAircraft();
 void drawRadarScreen();
 void fetchDataTask(void *pvParameters);
-void encoderTask(void *pvParameters);
+void inputTask(void *pvParameters);
 void Poweroff(String powermessage);
 double haversine(double lat1, double lon1, double lat2, double lon2);
 double calculateBearing(double lat1, double lon1, double lat2, double lon2);
@@ -133,18 +133,42 @@ void drawDottedCircle(int16_t x0, int16_t y0, int16_t r, uint16_t color);
 #define FREQ_MID 1200
 #define FREQ_HIGH 1800
 
-// --- Task for reading encoders reliably ---
-void encoderTask(void *pvParameters) {
+// --- Task for reading keyboard and touchpad input ---
+void inputTask(void *pvParameters) {
+  int16_t lastX = -1, lastY = -1;
   for (;;) {
-    byte vol_rotate_event = VolumeSelector.rotate();
-    if (vol_rotate_event != 0) { ChannelChange = vol_rotate_event; }
-    byte chan_rotate_event = ChannelSelector.rotate();
-    if (chan_rotate_event != 0) { VolumeChange = chan_rotate_event; }
-    byte vol_push_event = VolumeSelector.pushType(200);
-    if (vol_push_event != 0) { VolumePush = vol_push_event; }
-    byte chan_push_event = ChannelSelector.pushType(200);
-    if (chan_push_event != 0) { ChannelPush = chan_push_event; }
-    vTaskDelay(pdMS_TO_TICKS(5));
+    // Keyboard handling
+    Wire.requestFrom(LILYGO_KB_SLAVE_ADDRESS, 1);
+    while (Wire.available()) {
+      char c = Wire.read();
+      if (c == 'w') VolumeChange = 1;
+      else if (c == 's') VolumeChange = 2;
+      else if (c == 'd') ChannelChange = 1;
+      else if (c == 'a') ChannelChange = 2;
+      else if (c == 'm' || c == 'M') ChannelPush = 1;
+      else if (c == 'p' || c == 'P') VolumePush = 2;
+    }
+
+    // Touchpad handling
+    if (touch.isPressed()) {
+      int16_t x[1], y[1];
+      if (touch.getPoint(x, y, 1)) {
+        if (lastX >= 0) {
+          int dx = x[0] - lastX;
+          int dy = y[0] - lastY;
+          if (dx > 5) ChannelChange = 1;
+          else if (dx < -5) ChannelChange = 2;
+          if (dy > 5) VolumeChange = 2;
+          else if (dy < -5) VolumeChange = 1;
+        }
+        lastX = x[0];
+        lastY = y[0];
+      }
+    } else {
+      lastX = lastY = -1;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
@@ -176,22 +200,34 @@ void setup() {
   Serial.begin(115200);
   Serial.println("Booting Multi-Target Radar (Enhanced)");
 
+  pinMode(BOARD_POWERON, OUTPUT);
+  digitalWrite(BOARD_POWERON, HIGH);
+
   loadSettings();
   dataMutex = xSemaphoreCreateMutex();
   lastPingedAircraft.isValid = false; // CHANGED: Initialize new display variable
   closestInboundAircraft.isInbound = false;
   closestInboundAircraft.isValid = false;
-  
-  display.begin(0x3C, true);
-  display.clearDisplay();
+
+  display.begin();
+  display.setRotation(1);
+  display.fillScreen(TFT_BLACK);
   display.setTextSize(1);
-  display.setTextColor(SH110X_WHITE);
+  display.setTextColor(TFT_WHITE);
   display.setCursor(0, 0);
   display.println("Multi-Target Radar");
   display.setCursor(0, 16);
   display.println("Connecting WiFi...");
-  display.display();
-  
+
+  pinMode(BOARD_BL_PIN, OUTPUT);
+  digitalWrite(BOARD_BL_PIN, HIGH);
+
+  Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
+  touch.setPins(-1, BOARD_TOUCH_INT);
+  touch.begin(Wire, GT911_SLAVE_ADDRESS_L);
+  touch.setMaxCoordinates(SCREEN_WIDTH, SCREEN_HEIGHT);
+  touch.setSwapXY(true);
+
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   unsigned long wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < WIFI_CONNECT_TIMEOUT_MS) {
@@ -204,10 +240,9 @@ void setup() {
     WiFi.setSleep(false);
   } else {
     Serial.println("\nWiFi connection failed.");
-    display.fillRect(0, 16, SCREEN_WIDTH, 16, SH110X_BLACK);
+    display.fillRect(0, 16, SCREEN_WIDTH, 16, TFT_BLACK);
     display.setCursor(0, 16);
     display.println("WiFi Failed");
-    display.display();
   }
 
   i2s_config_t i2s_config = {.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX), .sample_rate = 44100, .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT, .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, .communication_format = I2S_COMM_FORMAT_STAND_I2S, .intr_alloc_flags = 0, .dma_buf_count = 8, .dma_buf_len = 64, .use_apll = false, .tx_desc_auto_clear = true, .fixed_mclk = 0};
@@ -216,7 +251,7 @@ void setup() {
   i2s_set_pin(I2S_NUM_0, &pin_config);
 
   xTaskCreatePinnedToCore(fetchDataTask, "FetchData", 8192, NULL, 2, NULL, 0);
-  xTaskCreatePinnedToCore(encoderTask, "Encoder", 2048, NULL, 3, NULL, 1);
+  xTaskCreatePinnedToCore(inputTask, "Input", 4096, NULL, 3, NULL, 1);
 }
 
 // --- MAIN LOOP ON CORE 1 (Graphics and Logic) ---
@@ -343,11 +378,10 @@ void Poweroff(String powermessage) {
   Serial.println("Powering off. Saving settings...");
   saveSettings();
   i2s_driver_uninstall(I2S_NUM_0);
-  display.clearDisplay();
+  display.fillScreen(TFT_BLACK);
   display.setTextSize(2);
   display.setCursor(0, 0);
   display.println(powermessage);
-  display.display();
   delay(1000);
   digitalWrite(19, LOW);
 }
@@ -400,27 +434,27 @@ void loadSettings() {
 }
 
 void drawRadarScreen() {
-  display.clearDisplay();
+  display.fillScreen(TFT_BLACK);
   display.setTextSize(1);
-  display.setTextColor(SH110X_WHITE);
+  display.setTextColor(TFT_WHITE);
 
   // Settings summary row
   display.setCursor(0, 0);
-  if (currentMode == VOLUME) display.setTextColor(SH110X_BLACK, SH110X_WHITE);
+  if (currentMode == VOLUME) display.setTextColor(TFT_BLACK, TFT_WHITE);
   display.print("V");
-  display.setTextColor(SH110X_WHITE);
+  display.setTextColor(TFT_WHITE);
   display.print(":");
   display.print(beepVolume);
   display.print(" ");
-  if (currentMode == SPEED) display.setTextColor(SH110X_BLACK, SH110X_WHITE);
+  if (currentMode == SPEED) display.setTextColor(TFT_BLACK, TFT_WHITE);
   display.print("S");
-  display.setTextColor(SH110X_WHITE);
+  display.setTextColor(TFT_WHITE);
   display.print(":");
   display.print(sweepSpeed, 0);
   display.print(" ");
-  if (currentMode == ALERT) display.setTextColor(SH110X_BLACK, SH110X_WHITE);
+  if (currentMode == ALERT) display.setTextColor(TFT_BLACK, TFT_WHITE);
   display.print("P");
-  display.setTextColor(SH110X_WHITE);
+  display.setTextColor(TFT_WHITE);
   display.print(":");
   display.print(inboundAlertDistanceKm, 0);
   display.print("k");
@@ -492,9 +526,9 @@ void drawRadarScreen() {
     int barX = wifiX + i * 3;
     int barY = wifiY - barHeight;
     if (i < bars) {
-      display.fillRect(barX, barY, 2, barHeight, SH110X_WHITE);
+      display.fillRect(barX, barY, 2, barHeight, TFT_WHITE);
     } else {
-      display.drawRect(barX, barY, 2, barHeight, SH110X_WHITE);
+      display.drawRect(barX, barY, 2, barHeight, TFT_WHITE);
     }
   }
 
@@ -502,41 +536,39 @@ void drawRadarScreen() {
   int16_t dumpX = wifiX - 6;
   int16_t dumpY = wifiY - 2;
   if (dataConnectionOk) {
-    display.fillCircle(dumpX, dumpY, 2, SH110X_WHITE);
+    display.fillCircle(dumpX, dumpY, 2, TFT_WHITE);
   } else {
-    display.drawCircle(dumpX, dumpY, 2, SH110X_WHITE);
-    display.drawLine(dumpX - 2, dumpY - 2, dumpX + 2, dumpY + 2, SH110X_WHITE);
-    display.drawLine(dumpX - 2, dumpY + 2, dumpX + 2, dumpY - 2, SH110X_WHITE);
+    display.drawCircle(dumpX, dumpY, 2, TFT_WHITE);
+    display.drawLine(dumpX - 2, dumpY - 2, dumpX + 2, dumpY + 2, TFT_WHITE);
+    display.drawLine(dumpX - 2, dumpY + 2, dumpX + 2, dumpY - 2, TFT_WHITE);
   }
 
-  display.drawCircle(RADAR_CENTER_X, RADAR_CENTER_Y, RADAR_RADIUS, SH110X_WHITE);
+  display.drawCircle(RADAR_CENTER_X, RADAR_CENTER_Y, RADAR_RADIUS, TFT_WHITE);
   display.setCursor(RADAR_CENTER_X - 3, RADAR_CENTER_Y - RADAR_RADIUS - 9);
-  if (currentMode == RADAR) display.setTextColor(SH110X_BLACK, SH110X_WHITE);
+  if (currentMode == RADAR) display.setTextColor(TFT_BLACK, TFT_WHITE);
   const char compassLetters[] = {'N','E','S','W'};
   display.print(compassLetters[compassIndex]);
-  if (currentMode == RADAR) display.setTextColor(SH110X_WHITE);
+  if (currentMode == RADAR) display.setTextColor(TFT_WHITE);
 
-  drawDottedCircle(RADAR_CENTER_X, RADAR_CENTER_Y, RADAR_RADIUS * 2 / 3, SH110X_WHITE);
-  drawDottedCircle(RADAR_CENTER_X, RADAR_CENTER_Y, RADAR_RADIUS * 1 / 3, SH110X_WHITE);
+  drawDottedCircle(RADAR_CENTER_X, RADAR_CENTER_Y, RADAR_RADIUS * 2 / 3, TFT_WHITE);
+  drawDottedCircle(RADAR_CENTER_X, RADAR_CENTER_Y, RADAR_RADIUS * 1 / 3, TFT_WHITE);
 
   unsigned long flashPhase = millis() / 300;
   for (const auto& blip : currentBlips) {
     if (blip.inbound && (flashPhase % 2)) continue;
     if (blip.lifespan > (BLIP_LIFESPAN_FRAMES * 2 / 3)) {
-      display.fillCircle(blip.x, blip.y, 3, SH110X_WHITE);
+      display.fillCircle(blip.x, blip.y, 3, TFT_WHITE);
     } else if (blip.lifespan > (BLIP_LIFESPAN_FRAMES * 1 / 3)) {
-      display.fillCircle(blip.x, blip.y, 2, SH110X_WHITE);
+      display.fillCircle(blip.x, blip.y, 2, TFT_WHITE);
     } else {
-      display.fillCircle(blip.x, blip.y, 1, SH110X_WHITE);
+      display.fillCircle(blip.x, blip.y, 1, TFT_WHITE);
     }
   }
 
   double sweepRad = sweepAngle * PI / 180.0;
   int16_t sweepX = RADAR_CENTER_X + (RADAR_RADIUS - 1) * sin(sweepRad);
   int16_t sweepY = RADAR_CENTER_Y - (RADAR_RADIUS - 1) * cos(sweepRad);
-  display.drawLine(RADAR_CENTER_X, RADAR_CENTER_Y, sweepX, sweepY, SH110X_WHITE);
-
-  display.display();
+  display.drawLine(RADAR_CENTER_X, RADAR_CENTER_Y, sweepX, sweepY, TFT_WHITE);
 }
 
 void fetchAircraft() {

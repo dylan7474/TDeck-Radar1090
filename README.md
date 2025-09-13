@@ -1,38 +1,34 @@
-# ClosestPlane ESP32
+# ClosestPlane ESP32 (T-Deck Edition)
 
-An Arduino-compatible sketch for ESP32 boards that connects to a dump1090 server and renders a sweeping radar view on a 128×64 SH1106 OLED. Aircraft within the selected range appear as blips and a short tone plays as the sweep crosses each target. Volume, radar range and sweep speed are controlled with two rotary encoders and saved to EEPROM.
+An Arduino-compatible sketch for the LilyGO T-Deck that connects to a dump1090 server and renders a sweeping radar view on the built-in 320×240 TFT display. Aircraft within the selected range appear as blips and a short tone plays as the sweep crosses each target. Volume, radar range and sweep speed are controlled with the T-Deck keyboard and touchpad and saved to EEPROM.
 
 ## Required Libraries
 
 Install the following libraries in the Arduino IDE before compiling:
 
-- **ESP32 board support** (`esp32` by Espressif) – provides WiFi, HTTPClient, Wire and I2S functionality.
-- **Adafruit GFX Library**
-- **Adafruit SH110X**
+- **ESP32 board support** (`esp32` by Espressif)
+- **TFT_eSPI**
+- **TouchDrvGT911**
 - **ArduinoJson**
-- **SimpleRotary** – handles the rotary encoders for volume and range control.
 
 ## Hardware Connections
 
-Connect the following components to your ESP32:
+The T-Deck integrates display, keyboard and touchpad, so only external audio hardware is required:
 
-- **SH1106 128×64 OLED** (I²C): SDA → GPIO21, SCL → GPIO22, plus 3.3 V and GND.
 - **MAX98357A I2S amplifier**: BCLK → GPIO17, LRCLK → GPIO16, DIN → GPIO27, SD → GPIO19, 3.3 V and GND.
-- **Range rotary encoder**: A → GPIO33, B → GPIO4, switch → GPIO23.
-- **Mode/volume rotary encoder**: A → GPIO25, B → GPIO32, switch → GPIO2.
 
 ## Setup
 1. Rename `config.h` with your WiFi credentials, dump1090 server address and your latitude/longitude. Adjust I2S pin numbers if required.
 2. Ensure the libraries above are installed in the Arduino IDE.
-3. Open `closestPlane.ino` in the Arduino IDE, select your ESP32 board and the correct port.
+3. Open `closestPlane.ino` in the Arduino IDE, select your ESP32-S3 board (e.g. **esp32s3**) and the correct port.
 4. Compile and upload.
 
 ## Operation
 - The display shows a radar sweep of aircraft within range. Each time the sweep crosses a target a short beep is produced.
-- Rotate the mode/volume encoder to adjust beep volume, sweep speed, alert distance, or to rotate the radar through the four compass points when compass mode is selected.
-- Press the mode/volume encoder to cycle between these control modes.
-- Rotate the range encoder to adjust radar range.
-- Long-press the range encoder to power off.
+- Use **W/S** keys or vertical touchpad swipes to adjust beep volume, sweep speed, alert distance, or rotate the radar when compass mode is selected.
+- Press **M** to cycle between control modes.
+- Use **A/D** keys or horizontal swipes to change radar range.
+- Press **P** to power off.
 - Settings persist in EEPROM and a small antenna icon indicates a good data connection.
 - Aircraft predicted to pass within the alert radius flash on the radar and trigger a single alert tone. The display shows minutes until the closest inbound aircraft reaches minimum distance.
 - Each aircraft is tracked individually in an `alertedFlights` list so it will only trigger the siren once while inbound.
@@ -115,13 +111,12 @@ echo "==> Installing ESP32 core"
 retry 5 5 arduino-cli core install esp32:esp32
 
 echo "==> Installing libraries"
-retry 5 5 arduino-cli lib install "Adafruit GFX Library"
+retry 5 5 arduino-cli lib install "TFT_eSPI"
+retry 5 5 arduino-cli lib install "TouchDrvGT911"
 retry 5 5 arduino-cli lib install "ArduinoJson"
-retry 5 5 arduino-cli lib install "Adafruit SH110X"
-retry 5 5 arduino-cli lib install "SimpleRotary"
 
 echo "✅ Setup complete. Compile with:"
-echo "   arduino-cli compile --fqbn esp32:esp32:esp32 closestPlane.ino"
+echo "   arduino-cli compile --fqbn esp32:esp32:esp32s3 closestPlane.ino"
 ```
 
-The command completes successfully when the required libraries (Adafruit SH110X, SimpleRotary, etc.) are installed.
+The command completes successfully when the required libraries (TFT_eSPI, TouchDrvGT911, etc.) are installed.
